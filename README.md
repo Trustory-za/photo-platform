@@ -89,3 +89,5 @@ The project is set up with proper error handling and follows Python best practic
 ## License
 
 This project is part of the photo licensing platform and is intended for commercial use with proper attribution.
+## Current Tools
+- `watermark.py` — Tiled diagonal watermarking (70% opacity, -30° rotation)
