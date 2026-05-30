@@ -1,46 +1,49 @@
-# Photo Platform
+# Trustory Images — Photo Licensing Platform
 
-A photo licensing platform for photographers to upload, manage, and license their images with IPTC metadata extraction capabilities.
+A South African photo licensing platform built for photographers to upload, watermark, and license their images. Developed for Charlé Lombard.
+
+## Overview
+
+Trustory Images lets photographers supply high-resolution images, extracts embedded IPTC metadata (captions, keywords, credit lines) automatically, applies a tiled diagonal watermark to protect copyright, and prepares images for licensing via Stripe payment before full-resolution downloads are released.
 
 ## Features
 
-- IPTC metadata extraction from JPG files
-- JSON output of metadata fields
-- Error handling for files with no IPTC data
-- Virtual environment setup for dependency management
+- **IPTC Metadata Extraction** — reads embedded metadata from JPG files using `iptcinfo3`: keywords, captions, bylines, credit lines, and more
+- **Automatic Watermarking** — tiles "© Trustory Images" across the full image in a diagonal grid pattern at 50 % opacity, rotated -30°, using Pillow
+- **Batch-Ready** — both tools operate as CLI scripts that accept file paths and return structured JSON output
+- **Error Handling** — graceful failure for missing files, non-image inputs, and files without IPTC data
+
+## Tech Stack
+
+- **Language:** Python 3.11
+- **Image Processing:** Pillow (PIL)
+- **Metadata Extraction:** iptcinfo3
 
 ## Installation
 
-1. Clone the repository:
 ```bash
+# Clone the repository
 git clone https://github.com/Trustory-za/photo-platform.git
 cd photo-platform
-```
 
-2. Create and activate a virtual environment:
-```bash
+# Create and activate a virtual environment
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
+source venv/bin/activate
 
-3. Install dependencies:
-```bash
-pip install iptcinfo3
+# Install dependencies
+pip install -r requirements.txt
 ```
 
 ## Usage
 
-### IPTC Metadata Reader
-
-Extract IPTC metadata from JPG files:
+### Extract IPTC Metadata
 
 ```bash
-python iptc_reader.py /path/to/your/image.jpg
+python iptc_reader.py path/to/image.jpg
 ```
 
-#### Example Output
+**Example output:**
 
-**For a file with IPTC metadata:**
 ```json
 {
   "success": true,
@@ -55,7 +58,8 @@ python iptc_reader.py /path/to/your/image.jpg
 }
 ```
 
-**For a file with no IPTC metadata:**
+If the file has no IPTC data:
+
 ```json
 {
   "error": "No IPTC data found",
@@ -64,30 +68,45 @@ python iptc_reader.py /path/to/your/image.jpg
 }
 ```
 
-**For an invalid file:**
+### Apply Watermark
+
+```bash
+python watermark.py input.jpg output.jpg
+```
+
+**Example output:**
+
 ```json
 {
-  "error": "File not found",
-  "file_path": "/path/to/missing.jpg",
-  "message": "The specified file does not exist"
+  "success": true,
+  "input_path": "/home/user/input.jpg",
+  "output_path": "/home/user/output.jpg",
+  "image_size": "4000x3000",
+  "watermark_text": "© Trustory Images"
 }
 ```
 
-## Dependencies
+The watermark tiles the text diagonally across the full image at 50 % opacity with -30° rotation — visible enough to deter unauthorised use without obscuring the photograph.
 
-- `iptcinfo3` - Library for reading IPTC metadata from image files
+## File Structure
 
-## Development
+```
+photo-platform/
+├── iptc_reader.py        # IPTC metadata extraction script
+├── watermark.py          # Image watermarking script
+├── requirements.txt      # Python dependencies
+├── README.md             # This file
+├── test.jpg              # Sample image for testing
+├── test.png              # Sample PNG for testing
+└── test_watermarked.jpg  # Sample watermarked output
+```
 
-The project is set up with proper error handling and follows Python best practices. The IPTC reader handles various edge cases including:
+## Development Notes
 
-- Non-existent files
-- Non-JPG files
-- Files with no IPTC metadata
-- Files with partial IPTC data
+- Both scripts return structured JSON output (exit code 0 on success, 1 on failure), making them suitable for integration into a larger pipeline
+- The watermark uses a binary search to find the optimal font size relative to the image dimensions — it adapts to any resolution
+- Placeholder test images (`test.jpg`, `test.png`) are included for local testing
 
 ## License
 
-This project is part of the photo licensing platform and is intended for commercial use with proper attribution.
-## Current Tools
-- `watermark.py` — Tiled diagonal watermarking (70% opacity, -30° rotation)
+This project is part of the Trustory Images photo licensing platform. All rights reserved.
