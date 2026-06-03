@@ -60,8 +60,155 @@ def _init_db() -> None:
     """
     conn = _get_connection()
     conn.execute(sql)
+    conn.execute(_PURCHASES_SCHEMA)
     conn.commit()
     conn.close()
+
+
+# ── Purchases table schema ──────────────────────────────────────────
+
+_PURCHASES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS purchases (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    photo_id          INTEGER NOT NULL,
+    paystack_reference TEXT   NOT NULL UNIQUE,
+    email             TEXT    NOT NULL,
+    amount_zar        INTEGER NOT NULL,
+    status            TEXT    NOT NULL DEFAULT 'pending',
+    download_token    TEXT    UNIQUE,
+    created_at        TEXT    NOT NULL,
+    paid_at           TEXT,
+    FOREIGN KEY (photo_id) REFERENCES photos(id)
+);
+"""
+
+
+# ── Purchase functions ──────────────────────────────────────────────
+
+def create_purchase(photo_id: int, email: str, reference: str, amount_zar: int = 15000) -> int:
+    """Insert a pending purchase row.
+
+    Args:
+        photo_id: The ID of the photo being purchased.
+        email: The buyer's email address.
+        reference: The Paystack transaction reference (must be unique).
+        amount_zar: The price in cents (default R150.00 = 15000).
+
+    Returns:
+        The row ID of the newly inserted purchase.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO purchases (photo_id, paystack_reference, email, amount_zar, status, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?)
+            """,
+            (photo_id, reference, email, amount_zar, now),
+        )
+        conn.commit()
+        row_id = cursor.lastrowid
+        if row_id is None:
+            raise RuntimeError("Purchase insert succeeded but returned no row ID.")
+        return row_id
+    finally:
+        conn.close()
+
+
+def confirm_purchase(reference: str, download_token: str) -> Optional[int]:
+    """Mark a purchase as paid.
+
+    Sets status to 'paid', records paid_at timestamp, and stores the
+    download token.
+
+    Args:
+        reference: The Paystack transaction reference.
+        download_token: A unique UUID string for download access.
+
+    Returns:
+        The purchase ID if found and updated, or None if not found.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE purchases
+            SET status = 'paid', paid_at = ?, download_token = ?
+            WHERE paystack_reference = ? AND status = 'pending'
+            """,
+            (now, download_token, reference),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return None
+        row = conn.execute(
+            "SELECT id FROM purchases WHERE paystack_reference = ?",
+            (reference,),
+        ).fetchone()
+        return row["id"] if row else None
+    finally:
+        conn.close()
+
+
+def get_purchase_by_token(token: str) -> Optional[dict[str, Any]]:
+    """Look up a purchase by its download token.
+
+    Args:
+        token: The unique download token UUID.
+
+    Returns:
+        A dict of the purchase row, or None if not found.
+    """
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM purchases WHERE download_token = ?", (token,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_purchase_by_reference(reference: str) -> Optional[dict[str, Any]]:
+    """Look up a purchase by its Paystack transaction reference.
+
+    Args:
+        reference: The Paystack transaction reference.
+
+    Returns:
+        A dict of the purchase row, or None if not found.
+    """
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM purchases WHERE paystack_reference = ?", (reference,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def mark_downloaded(token: str) -> bool:
+    """Mark a download token as used (status = 'downloaded').
+
+    Args:
+        token: The download token.
+
+    Returns:
+        True if updated, False if not found.
+    """
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            "UPDATE purchases SET status = 'downloaded' WHERE download_token = ? AND status = 'paid'",
+            (token,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
 
 
 # ── Core functions ──────────────────────────────────────────────────────
