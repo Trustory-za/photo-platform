@@ -18,6 +18,9 @@ import sys
 import time
 from pathlib import Path
 
+# Local imports
+import database
+
 from watchdog.events import PatternMatchingEventHandler
 from watchdog.observers import Observer
 
@@ -105,6 +108,13 @@ def _process_jpg(file_path: Path) -> None:
             orig_size,
             prev_size,
         )
+
+        # Insert into database
+        try:
+            row_id = database.insert_photo(data)
+            logger.info("DB INSERT %s  row_id=%s", file_path.name, row_id)
+        except Exception as e:
+            logger.error("DB INSERT FAILED %s  (%s)", file_path.name, e)
     else:
         logger.error(
             "PROCESSING FAILED %s  error: %s",

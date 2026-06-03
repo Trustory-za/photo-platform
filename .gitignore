@@ -9,3 +9,5 @@ test_watermarked.jpg
 uploads/
 logs/
 test_output/
+photos.db
+.claude/
