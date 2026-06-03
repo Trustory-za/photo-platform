@@ -231,6 +231,16 @@ def list_all_photos() -> list[dict[str, Any]]:
         conn.close()
 
 
+def count_photos() -> int:
+    """Return the total number of photos in the database."""
+    conn = _get_connection()
+    try:
+        row = conn.execute("SELECT COUNT(*) as cnt FROM photos").fetchone()
+        return row["cnt"] if row else 0
+    finally:
+        conn.close()
+
+
 # ── Internal helpers ────────────────────────────────────────────────────
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
