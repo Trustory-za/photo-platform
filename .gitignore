@@ -5,3 +5,7 @@ test.jpg
 test.png
 test_watermarked.jpg
 .DS_Store
+.env
+uploads/
+logs/
+test_output/
