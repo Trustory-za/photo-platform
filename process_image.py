@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""
-process_image.py — Core pipeline for The Sport Collective photo platform.
+"""process_image.py — Core pipeline for The Sport Collective photo platform.
 
 Combines IPTC metadata extraction and watermarking into a single command.
 Takes an input JPG and an output base directory, produces:
   - preview_[filename] — watermarked version
   - original_[filename] — untouched clean copy
 
-Files are organised into: output_dir/{photographer}/{yyyy-mm-dd-EventName}/
-where photographer, date, and event are read from IPTC metadata.
+Files are organised into: output_dir/{photographer}/{yyyy-mm-dd-sanitised-headline}/
+where photographer, date, and headline are read from IPTC metadata.
 
 Outputs a single JSON result to stdout.
 
@@ -164,14 +163,16 @@ def _sanitise_photographer(name: str) -> str:
     return name or "Unknown_Photographer"
 
 
-def _sanitise_event(event: str) -> str:
-    """Sanitise an event name for use as a directory name.
-    Replace spaces with -, remove non-alphanumeric chars except _ and -."""
-    if not event:
-        return "Unknown_Event"
-    event = event.strip().replace(" ", "-")
-    event = re.sub(r"[^a-zA-Z0-9_.-]", "", event)
-    return event or "Unknown_Event"
+def _sanitise_headline(headline: str) -> str:
+    """Sanitise a headline for use as a directory name.
+    Replace spaces with -, remove non-alphanumeric chars except _ and -,
+    truncate to 60 characters max."""
+    if not headline:
+        return "Unknown-Event"
+    headline = headline.strip().replace(" ", "-")
+    headline = re.sub(r"[^a-zA-Z0-9_.-]", "", headline)
+    headline = headline[:60]
+    return headline or "Unknown-Event"
 
 
 def _format_date(date_str: str) -> str:
@@ -230,15 +231,15 @@ def process_image(input_path: str, output_dir: str) -> dict:
         return str(v).strip() or None
 
     photographer = _first(iptc_data.get("by-line")) or "Unknown_Photographer"
-    event = _first(iptc_data.get("event")) or "Unknown_Event"
+    headline = _first(iptc_data.get("headline")) or "Unknown-Event"
     raw_date = _first(iptc_data.get("date created")) or ""
 
     photographer_safe = _sanitise_photographer(photographer)
-    event_safe = _sanitise_event(event)
+    headline_safe = _sanitise_headline(headline)
     date_formatted = _format_date(raw_date)
 
-    # ── 3. Build subdirectory: base / photographer / date-event / ─────────
-    subdir_name = f"{date_formatted}-{event_safe}"
+    # ── 3. Build subdirectory: base / photographer / date-headline / ─────────
+    subdir_name = f"{date_formatted}-{headline_safe}"
     out_dir = base_dir / photographer_safe / subdir_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -277,7 +278,7 @@ def process_image(input_path: str, output_dir: str) -> dict:
         "original_photographer": photographer_safe,
         "original_subdir": subdir_name,
         "photographer": photographer,
-        "event": event,
+        "headline": headline,
         "date_created": raw_date,
         "original_path": str(orig_path.resolve()),
         "preview_path": str(preview_path.resolve()),
