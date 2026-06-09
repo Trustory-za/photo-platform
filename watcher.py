@@ -152,8 +152,60 @@ class JpgUploadHandler(PatternMatchingEventHandler):
         logger.debug("EVENT on_moved: %s -> %s", getattr(event, 'src_path', ''), getattr(event, 'dest_path', ''))
         self._handle(event)
 
+    def _wait_until_stable(self, file_path: Path, max_checks: int = 6) -> bool:
+        """
+        Wait for a file to finish being written.
+
+        Strategy:
+          1. Wait 2 seconds for the initial write burst to settle.
+          2. Check the file size.
+          3. Wait 1 more second and check again.
+          4. If the size is the same both times, the file is stable — proceed.
+          5. If not, keep checking (up to *max_checks* pairs) until stable.
+
+        Returns True if the file is stable, False if it gave up.
+        """
+        for attempt in range(1, max_checks + 1):
+            # Wait before the first read, and between each pair of reads
+            time.sleep(2.0 if attempt == 1 else 1.0)
+
+            if not file_path.exists():
+                logger.warning("STABILITY FILE VANISHED %s  (attempt %d/%d)",
+                               file_path.name, attempt, max_checks)
+                return False
+
+            size_a = file_path.stat().st_size
+
+            if size_a == 0:
+                logger.debug("STABILITY EMPTY %s  (attempt %d/%d, still writing…)",
+                             file_path.name, attempt, max_checks)
+                continue  # skip sleep — already waited above; go to next pair
+
+            time.sleep(1.0)
+
+            if not file_path.exists():
+                logger.warning("STABILITY FILE VANISHED %s  (attempt %d/%d, after second wait)",
+                               file_path.name, attempt, max_checks)
+                return False
+
+            size_b = file_path.stat().st_size
+
+            if size_a == size_b:
+                logger.info("STABLE %s  size=%d bytes  (after %d check pair%s)",
+                            file_path.name, size_a, attempt,
+                            "s" if attempt > 1 else "")
+                return True
+
+            logger.debug("STABILITY GROWING %s  size changed: %d → %d  (attempt %d/%d)",
+                         file_path.name, size_a, size_b, attempt, max_checks)
+
+        # Exhausted all attempts — file is still changing or stuck
+        logger.error("STABILITY TIMEOUT %s  (not stable after %d checks)",
+                     file_path.name, max_checks)
+        return False
+
     def _handle(self, event):
-        """Process the file — with a short delay for the upload to finish."""
+        """Process the file — wait for it to be fully written first."""
         src = event.src_path
         logger.debug("_handle called: src_path=%s", src)
 
@@ -178,12 +230,9 @@ class JpgUploadHandler(PatternMatchingEventHandler):
         if file_path.suffix.lower() not in (".jpg", ".jpeg"):
             return
 
-        # Short delay to let the file finish writing (FTP may still be flushing)
-        time.sleep(1.0)
-
-        # Final check — file must be non-empty and stable
-        if file_path.stat().st_size == 0:
-            logger.warning("SKIP (empty) %s", file_path.name)
+        # Wait until the file is fully written (FTP may still be flushing)
+        if not self._wait_until_stable(file_path):
+            logger.warning("ABORT %s  (file never stabilised)", file_path.name)
             return
 
         _process_jpg(file_path)
