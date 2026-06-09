@@ -41,7 +41,7 @@ def _extract_iptc(file_path: str) -> dict:
     standard_fields = [
         'caption/abstract', 'keywords', 'by-line', 'byline/title',
         'creditline', 'source', 'copyright notice', 'contact',
-        'object name', 'edit status', 'urgency', 'category',
+        'headline', 'object name', 'edit status', 'urgency', 'category',
         'supplemental category', 'date created', 'time created',
         'digital date created', 'digital time created',
         'originating program', 'program version',

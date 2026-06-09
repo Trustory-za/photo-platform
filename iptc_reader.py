@@ -64,7 +64,7 @@ def read_iptc_metadata(file_path):
             standard_fields = [
                 'caption/abstract', 'keywords', 'by-line', 'byline/title', 
                 'creditline', 'source', 'copyright notice', 'contact',
-                'object name', 'edit status', 'urgency', 'category',
+                'headline', 'object name', 'edit status', 'urgency', 'category',
                 'supplemental category', 'date created', 'time created',
                 'digital date created', 'digital time created',
                 'originating program', 'program version'
