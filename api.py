@@ -1,3 +1,4 @@
+import json
 #!/usr/bin/env python3
 """
 api.py — FastAPI web API for the Trustory Images photo platform.
@@ -40,7 +41,7 @@ PAYSTACK_CALLBACK_URL = os.environ.get(
 PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
 PAYSTACK_VERIFY_URL = "https://api.paystack.co/transaction/verify"
 
-PHOTO_PRICE_ZAR = 15000  # R150.00 in cents
+PHOTO_PRICE_ZAR = 50000  # R500.00 in cents
 
 app = FastAPI(
     title="Trustory Images API",
@@ -103,6 +104,29 @@ def _sanitise(photo: dict) -> dict:
 # ── Endpoints ───────────────────────────────────────────────────────
 
 
+
+@app.get("/events/{slug}")
+def get_event_photos(slug: str):
+    """Return all photos for a specific event by slug."""
+    photos = database.list_all_photos()
+    result = []
+    for p in photos:
+        headline = p.get("headline") or "Unknown Event"
+        photo_slug = (
+            headline.lower()
+            .replace(" ", "-")
+            .replace(":", "")
+            .replace("/", "")
+            .replace("\\", "")
+            .replace("'", "")
+            .replace('"', "")
+            .replace("--", "-")
+            .strip("-")
+        )
+        if photo_slug == slug:
+            result.append(_sanitise(p))
+    return result
+
 @app.get("/health")
 def health():
     """Health check — no API key required."""
@@ -132,9 +156,8 @@ def search_photos(
 
 
 @app.get("/events")
-def list_events(x_api_key: str | None = Header(None)):
+def list_events():
     """Return all photos grouped by headline into events."""
-    _verify_api_key(x_api_key)
     photos = database.list_all_photos()
 
     # Group photos by headline
@@ -170,7 +193,7 @@ def list_events(x_api_key: str | None = Header(None)):
             events[headline] = {
                 "headline": headline,
                 "slug": slug,
-                "date": p.get("processed_at"),
+                "date": (lambda d: f"{d[6:8]} {['January','February','March','April','May','June','July','August','September','October','November','December'][int(d[4:6])-1]} {d[0:4]}" if d and len(d)==8 else p.get("processed_at"))((((p.get("full_iptc") if isinstance(p.get("full_iptc"), dict) else __import__('json').loads(p.get("full_iptc") or "{}")) or {}).get("date created") or "").replace("-","")),
                 "photo_count": 0,
                 "cover_photo_url": sanitised_p.get("preview_url"),
                 "location": location,
