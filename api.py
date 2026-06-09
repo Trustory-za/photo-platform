@@ -147,10 +147,8 @@ def get_photo(
 @app.get("/photos/{photo_id}/preview")
 def get_preview(
     photo_id: int,
-    x_api_key: str | None = Header(None),
 ):
     """Serve the watermarked preview image directly."""
-    _verify_api_key(x_api_key)
     photo = database.get_photo(photo_id)
     if photo is None:
         raise HTTPException(status_code=404, detail="Photo not found")
