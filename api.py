@@ -85,7 +85,7 @@ PUBLIC_FIELDS = {
     "id", "filename", "file_size_original",
     "file_size_preview", "processed_at", "caption", "keywords",
     "byline", "copyright", "city", "country", "headline", "source",
-    "full_iptc",
+    "event", "full_iptc",
 }
 
 

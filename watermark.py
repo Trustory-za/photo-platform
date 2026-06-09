@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Watermark script for Trustory Images photo platform.
-Tiles '© Trustory Images' across the full image in a diagonal grid
+"""Watermark script for The Sport Collective photo platform.
+Tiles '© The Sport Collective' across the full image in a diagonal grid
 pattern at 50% opacity, rotated -30 degrees.
 
 Usage:
@@ -54,12 +54,12 @@ def _find_best_font(text, target_height, font_path=None):
 
 
 def watermark_image(input_path: str, output_path: str) -> dict:
-    """Tile a -30° rotated '© Trustory Images' across the image at 50 % opacity."""
+    """Tile a -30° rotated '© The Sport Collective' across the image at 50 % opacity."""
     try:
         src = Image.open(input_path).convert("RGBA")
         iw, ih = src.size
 
-        text = "© Trustory Images"
+        text = "© The Sport Collective"
 
         # ---------- font sizing ----------
         # Tile text ~4 % of the shorter edge — small enough to tile, big enough to read.

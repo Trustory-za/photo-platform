@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-process_image.py — Core pipeline for the Trustory Images photo platform.
+process_image.py — Core pipeline for The Sport Collective photo platform.
 
 Combines IPTC metadata extraction and watermarking into a single command.
-Takes an input JPG and an output directory, produces:
+Takes an input JPG and an output base directory, produces:
   - preview_[filename] — watermarked version
   - original_[filename] — untouched clean copy
+
+Files are organised into: output_dir/{photographer}/{yyyy-mm-dd-EventName}/
+where photographer, date, and event are read from IPTC metadata.
 
 Outputs a single JSON result to stdout.
 
@@ -14,6 +17,7 @@ Usage:
 """
 
 import json
+import re
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -26,7 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 # ── IPTC logic (self-contained, mirrors iptc_reader.py) ──────────────────────
 
 def _extract_iptc(file_path: str) -> dict:
-    """Read IPTC metadata from a JPG and return a dict of field→value(s).
+    """Read IPTC metadata from a JPG and return a dict of field->value(s).
 
     Returns an empty dict if no IPTC data is found; caller handles errors.
     """
@@ -42,6 +46,7 @@ def _extract_iptc(file_path: str) -> dict:
         'supplemental category', 'date created', 'time created',
         'digital date created', 'digital time created',
         'originating program', 'program version',
+        'event',
     ]
 
     cleaned = {}
@@ -50,8 +55,13 @@ def _extract_iptc(file_path: str) -> dict:
             value = info[field]
             if value is None or value == '':
                 continue
-            if isinstance(value, (list, tuple)):
-                cleaned[field] = [str(v) for v in value if v]
+            if isinstance(value, bytes):
+                cleaned[field] = value.decode("utf-8", errors="replace")
+            elif isinstance(value, (list, tuple)):
+                cleaned[field] = [
+                    v.decode("utf-8", errors="replace") if isinstance(v, bytes) else str(v)
+                    for v in value if v
+                ]
             else:
                 cleaned[field] = str(value)
     return cleaned
@@ -96,11 +106,11 @@ def _find_best_font(text, target_height, font_path=None):
 
 
 def _apply_watermark(input_path: str, output_path: str) -> None:
-    """Tile '© Trustory Images' at -30° rotation, 50 % opacity."""
+    """Tile '© The Sport Collective' at -30° rotation, 50 % opacity."""
     src = Image.open(input_path).convert("RGBA")
     iw, ih = src.size
 
-    text = "© Trustory Images"
+    text = "© The Sport Collective"
 
     # Font size ~4 % of the shorter edge
     target_h = min(iw, ih) * 0.04
@@ -141,13 +151,51 @@ def _apply_watermark(input_path: str, output_path: str) -> None:
     result.save(output_path, "JPEG", quality=95)
 
 
+# ── Filesystem sanitisation helpers ─────────────────────────────────────
+
+
+def _sanitise_photographer(name: str) -> str:
+    """Sanitise a photographer name for use as a directory name.
+    Replace spaces with _, remove non-alphanumeric chars except _ and -."""
+    if not name:
+        return "Unknown_Photographer"
+    name = name.strip().replace(" ", "_")
+    name = re.sub(r"[^a-zA-Z0-9_.-]", "", name)
+    return name or "Unknown_Photographer"
+
+
+def _sanitise_event(event: str) -> str:
+    """Sanitise an event name for use as a directory name.
+    Replace spaces with -, remove non-alphanumeric chars except _ and -."""
+    if not event:
+        return "Unknown_Event"
+    event = event.strip().replace(" ", "-")
+    event = re.sub(r"[^a-zA-Z0-9_.-]", "", event)
+    return event or "Unknown_Event"
+
+
+def _format_date(date_str: str) -> str:
+    """Convert '20221017' to '2022-10-17'. Returns '0000-00-00' if missing."""
+    if not date_str:
+        return "0000-00-00"
+    digits = re.sub(r"\D", "", date_str)
+    if len(digits) == 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    # Already partially formatted or longer — take first 10 chars
+    candidate = digits[:10]
+    if len(candidate) >= 8:
+        # Try to format as yyyy-mm-dd
+        return f"{candidate[:4]}-{candidate[4:6]}-{candidate[6:8]}"
+    return "0000-00-00"
+
+
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
 def process_image(input_path: str, output_dir: str) -> dict:
     """Run the full pipeline and return a JSON-serialisable result dict."""
     now = datetime.now(timezone.utc).isoformat()
     inp = Path(input_path)
-    out_dir = Path(output_dir)
+    base_dir = Path(output_dir)
 
     # ── Validate input ────────────────────────────────────────────────────
     if not inp.exists():
@@ -164,26 +212,47 @@ def process_image(input_path: str, output_dir: str) -> dict:
             "processed_at": now,
         }
 
-    # ── Ensure output directory exists ─────────────────────────────────────
+    # ── 1. Read IPTC metadata (needed early for folder structure) ────────
+    iptc_data = _extract_iptc(str(inp))
+
+    # ── 2. Determine photographer, date, event from IPTC ─────────────────
+    def _first(v):
+        if v is None:
+            return None
+        # IPTC fields can be bytes objects — decode to string first
+        if isinstance(v, bytes):
+            return v.decode("utf-8", errors="replace").strip() or None
+        if isinstance(v, (list, tuple)) and len(v) > 0:
+            item = v[0]
+            if isinstance(item, bytes):
+                return item.decode("utf-8", errors="replace").strip() or None
+            return str(item).strip() or None
+        return str(v).strip() or None
+
+    photographer = _first(iptc_data.get("by-line")) or "Unknown_Photographer"
+    event = _first(iptc_data.get("event")) or "Unknown_Event"
+    raw_date = _first(iptc_data.get("date created")) or ""
+
+    photographer_safe = _sanitise_photographer(photographer)
+    event_safe = _sanitise_event(event)
+    date_formatted = _format_date(raw_date)
+
+    # ── 3. Build subdirectory: base / photographer / date-event / ─────────
+    subdir_name = f"{date_formatted}-{event_safe}"
+    out_dir = base_dir / photographer_safe / subdir_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    base_stem = inp.stem
-    # Keep original extension (.jpg or .jpeg) as-is
-    ext = inp.suffix
-
+    # ── 4. Prepare filenames ──────────────────────────────────────────────
     orig_name = f"original_{inp.name}"
     preview_name = f"preview_{inp.name}"
 
     orig_path = out_dir / orig_name
     preview_path = out_dir / preview_name
 
-    # ── 1. Copy original ──────────────────────────────────────────────────
+    # ── 5. Copy original ─────────────────────────────────────────────────
     shutil.copy2(str(inp), str(orig_path))
 
-    # ── 2. Read IPTC metadata ─────────────────────────────────────────────
-    iptc_data = _extract_iptc(str(inp))
-
-    # ── 3. Create watermarked preview ─────────────────────────────────────
+    # ── 6. Create watermarked preview ────────────────────────────────────
     try:
         _apply_watermark(str(inp), str(preview_path))
     except Exception as e:
@@ -191,16 +260,25 @@ def process_image(input_path: str, output_dir: str) -> dict:
             "success": False,
             "error": f"Watermark failed: {e}",
             "original_path": str(orig_path.resolve()),
+            "original_filename": inp.name,
+            "original_photographer": photographer_safe,
+            "original_subdir": subdir_name,
             "iptc": iptc_data,
             "processed_at": now,
         }
 
-    # ── File sizes ─────────────────────────────────────────────────────────
+    # ── 7. File sizes ─────────────────────────────────────────────────────
     fs_orig = orig_path.stat().st_size
     fs_preview = preview_path.stat().st_size
 
     return {
         "success": True,
+        "original_filename": inp.name,
+        "original_photographer": photographer_safe,
+        "original_subdir": subdir_name,
+        "photographer": photographer,
+        "event": event,
+        "date_created": raw_date,
         "original_path": str(orig_path.resolve()),
         "preview_path": str(preview_path.resolve()),
         "iptc": iptc_data,

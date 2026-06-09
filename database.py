@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-database.py — SQLite database layer for the Trustory Images photo platform.
+database.py — SQLite database layer for The Sport Collective photo platform.
 
 Stores every processed image with its full IPTC metadata so we can
 search and serve photos.
@@ -54,12 +54,18 @@ def _init_db() -> None:
         country             TEXT,
         headline            TEXT,
         source              TEXT,
+        event               TEXT,
         full_iptc           TEXT,
         search_text         TEXT
     );
     """
     conn = _get_connection()
     conn.execute(sql)
+    # Migration: add event column for existing databases
+    try:
+        conn.execute("ALTER TABLE photos ADD COLUMN event TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.execute(_PURCHASES_SCHEMA)
     conn.commit()
     conn.close()
@@ -241,12 +247,14 @@ def insert_photo(result: dict[str, Any]) -> int:
     country = _first_str(iptc.get("country"))
     headline = _first_str(iptc.get("headline"))
     source = _first_str(iptc.get("source"))
+    event = _first_str(iptc.get("event"))
 
     # Build search_text — combine all text fields for easy searching
     search_parts = [
         caption or "",
         headline or "",
         byline or "",
+        event or "",
         city or "",
         country or "",
         " ".join(keywords_list) if keywords_list else "",
@@ -267,8 +275,8 @@ def insert_photo(result: dict[str, Any]) -> int:
                 filename, original_path, preview_path,
                 file_size_original, file_size_preview, processed_at,
                 caption, keywords, byline, copyright, city, country,
-                headline, source, full_iptc, search_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                headline, source, event, full_iptc, search_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 filename,
@@ -285,6 +293,7 @@ def insert_photo(result: dict[str, Any]) -> int:
                 country,
                 headline,
                 source,
+                event,
                 full_iptc,
                 search_text,
             ),
