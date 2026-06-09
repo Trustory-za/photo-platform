@@ -131,6 +131,61 @@ def search_photos(
     return [_sanitise(p) for p in photos]
 
 
+@app.get("/events")
+def list_events(x_api_key: str | None = Header(None)):
+    """Return all photos grouped by headline into events."""
+    _verify_api_key(x_api_key)
+    photos = database.list_all_photos()
+
+    # Group photos by headline
+    events: dict[str, dict] = {}
+    for p in photos:
+        headline = p.get("headline") or "Unknown Event"
+        if headline not in events:
+            # Sanitise to get preview_url
+            sanitised_p = _sanitise(p)
+
+            # Extract location from caption (text before first colon or comma)
+            caption = p.get("caption") or ""
+            location = ""
+            for sep in [":", ","]:
+                parts = caption.split(sep, 1)
+                if len(parts) > 1:
+                    location = parts[0].strip()
+                    break
+
+            # Sanitise headline into a URL slug
+            slug = (
+                headline.lower()
+                .replace(" ", "-")
+                .replace(":", "")
+                .replace("/", "")
+                .replace("\\", "")
+                .replace("'", "")
+                .replace('"', "")
+                .replace("--", "-")
+                .strip("-")
+            )
+
+            events[headline] = {
+                "headline": headline,
+                "slug": slug,
+                "date": p.get("processed_at"),
+                "photo_count": 0,
+                "cover_photo_url": sanitised_p.get("preview_url"),
+                "location": location,
+            }
+        events[headline]["photo_count"] += 1
+
+    # Sort by date descending (most recent first)
+    result = sorted(
+        events.values(),
+        key=lambda e: e["date"] or "",
+        reverse=True,
+    )
+    return result
+
+
 @app.get("/photos/{photo_id}")
 def get_photo(
     photo_id: int,
