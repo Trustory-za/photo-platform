@@ -80,9 +80,9 @@ def _verify_api_key(x_api_key: str | None = None) -> None:
 
 # ── Response helpers ────────────────────────────────────────────────
 
-# Fields safe for public display — NEVER include original_path
+# Fields safe for public display — NEVER include original_path or preview_path
 PUBLIC_FIELDS = {
-    "id", "filename", "preview_path", "file_size_original",
+    "id", "filename", "file_size_original",
     "file_size_preview", "processed_at", "caption", "keywords",
     "byline", "copyright", "city", "country", "headline", "source",
     "full_iptc",
@@ -90,8 +90,14 @@ PUBLIC_FIELDS = {
 
 
 def _sanitise(photo: dict) -> dict:
-    """Strip internal fields (original_path) from a photo dict."""
-    return {k: v for k, v in photo.items() if k in PUBLIC_FIELDS}
+    """Strip internal fields (original_path, preview_path) from a photo dict
+    and add a public preview_url instead."""
+    sanitised = {k: v for k, v in photo.items() if k in PUBLIC_FIELDS}
+    # Add preview_url derived from the database ID
+    photo_id = sanitised.get("id")
+    if photo_id is not None:
+        sanitised["preview_url"] = f"https://photos.olympusbot.cloud/photos/{photo_id}/preview"
+    return sanitised
 
 
 # ── Endpoints ───────────────────────────────────────────────────────

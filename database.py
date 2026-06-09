@@ -401,14 +401,31 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return d
 
 
+def _decode_bytes(value: Any) -> Any:
+    """Decode bytes to str, handling both raw bytes and their repr form.
+
+    IPTC fields from Pillow's IptcImagePlugin come back as bytes objects.
+    When passed through str() or other operations, they can end up as
+    ``b'Charle Lombard'`` instead of ``Charle Lombard``.
+    """
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    if isinstance(value, str) and value.startswith("b'") and value.endswith("'"):
+        return value[2:-1]
+    return value
+
+
 def _first_str(value: Any) -> Optional[str]:
     """Return the first string from a value that could be str, list, or None."""
     if value is None:
         return None
+    # Decode bytes before processing
+    value = _decode_bytes(value)
     if isinstance(value, str):
         return value.strip() or None
     if isinstance(value, (list, tuple)) and len(value) > 0:
         v = value[0]
+        v = _decode_bytes(v)
         return str(v).strip() if v else None
     return str(value).strip() or None
 
@@ -417,10 +434,17 @@ def _flatten_list(value: Any) -> list[str]:
     """Flatten a value into a list of non-empty strings."""
     if value is None:
         return []
+    # Decode bytes before processing
+    value = _decode_bytes(value)
     if isinstance(value, str):
         return [value.strip()] if value.strip() else []
     if isinstance(value, (list, tuple)):
-        return [str(v).strip() for v in value if v and str(v).strip()]
+        result = []
+        for v in value:
+            v = _decode_bytes(v)
+            if v and str(v).strip():
+                result.append(str(v).strip())
+        return result
     return [str(value).strip()] if str(value).strip() else []
 
 
