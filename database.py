@@ -35,6 +35,20 @@ def _get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_unique_index() -> None:
+    """
+    Ensure a unique index on filename so duplicate rows are impossible.
+    Created separately from _init_db so existing databases pick it up
+    without a full migration.
+    """
+    conn = _get_connection()
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_filename ON photos(filename)"
+    )
+    conn.commit()
+    conn.close()
+
+
 def _init_db() -> None:
     """Create the photos table if it does not already exist."""
     sql = """
@@ -61,6 +75,10 @@ def _init_db() -> None:
     """
     conn = _get_connection()
     conn.execute(sql)
+    # Ensure unique index on filename (for existing databases)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_filename ON photos(filename)"
+    )
     # Migration: add event column for existing databases
     try:
         conn.execute("ALTER TABLE photos ADD COLUMN event TEXT")
@@ -271,7 +289,7 @@ def insert_photo(result: dict[str, Any]) -> int:
     try:
         cursor = conn.execute(
             """
-            INSERT INTO photos (
+            INSERT OR REPLACE INTO photos (
                 filename, original_path, preview_path,
                 file_size_original, file_size_preview, processed_at,
                 caption, keywords, byline, copyright, city, country,

@@ -138,9 +138,11 @@ class JpgUploadHandler(PatternMatchingEventHandler):
             case_sensitive=False,
         )
         # Track recently processed paths to avoid double-processing
-        self._recently_processed = {}
+        self._recently_processed: dict[str, float] = {}
         # Track files currently being checked for stability
         self._pending_check: set[str] = set()
+        # Track files already processed in this session
+        self._processed_files: set[str] = set()
 
     def on_created(self, event):
         logger.debug("EVENT on_created: %s", event.src_path)
@@ -235,6 +237,11 @@ class JpgUploadHandler(PatternMatchingEventHandler):
             logger.debug("SKIP (recently processed) %s", file_path.name)
             return
 
+        # Session dedup — skip files already processed in this session lifetime
+        if src in self._processed_files:
+            logger.debug("SKIP (already processed this session) %s", file_path.name)
+            return
+
         logger.debug("_handle: resolved=%s suffix=%s exists=%s size=%s",
                      file_path, file_path.suffix, file_path.exists(),
                      file_path.stat().st_size if file_path.exists() else 'N/A')
@@ -264,6 +271,7 @@ class JpgUploadHandler(PatternMatchingEventHandler):
 
         # Mark as processed so duplicate events are ignored
         self._recently_processed[src] = time.time()
+        self._processed_files.add(src)
 
         # Clear the pending-check lock
         self._pending_check.discard(src)
