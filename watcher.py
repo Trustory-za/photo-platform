@@ -156,27 +156,21 @@ class JpgUploadHandler(PatternMatchingEventHandler):
         logger.debug("EVENT on_moved: %s -> %s", getattr(event, 'src_path', ''), getattr(event, 'dest_path', ''))
         self._handle(event)
 
-    def _wait_until_stable(self, file_path: Path, max_checks: int = 20) -> bool:
+    def _wait_until_stable(self, file_path: Path, max_checks: int = 15) -> bool:
         """
-        Wait for a file to finish being written.
+        Wait for a file to finish being written before processing.
 
-        Strategy:
-          1. Wait 3 seconds for the initial write burst to settle.
-          2. Check the file size.
-          3. Wait 2 more seconds and check again.
-          4. If the size is the same both times, cross-check the modification
-             timestamp — if the file was modified within the last 3 seconds
-             it may still be receiving data over a slow connection.
-          5. If not stable, keep checking (up to *max_checks* pairs).
+        Strategy: wait 2 seconds for the initial write burst, check file size,
+        wait 1 second, check again. If the size is the same both times the
+        file is considered stable. If not, repeat the pair until it settles.
+
+        With max_checks=15 this waits up to ~30 seconds (2s initial + 14 × 2s),
+        which handles large photos from slow FTP connections.
 
         Returns True if the file is stable, False if it gave up.
         """
         for attempt in range(1, max_checks + 1):
-            # Initial wait is longer; subsequent waits use shorter gaps
-            if attempt == 1:
-                time.sleep(3.0)
-            else:
-                time.sleep(2.0)
+            time.sleep(2.0)
 
             if not file_path.exists():
                 logger.warning("STABILITY FILE VANISHED %s  (attempt %d/%d)",
@@ -190,7 +184,7 @@ class JpgUploadHandler(PatternMatchingEventHandler):
                              file_path.name, attempt, max_checks)
                 continue
 
-            time.sleep(2.0)
+            time.sleep(1.0)
 
             if not file_path.exists():
                 logger.warning("STABILITY FILE VANISHED %s  (attempt %d/%d, after second wait)",
@@ -204,17 +198,9 @@ class JpgUploadHandler(PatternMatchingEventHandler):
                              file_path.name, size_a, size_b, attempt, max_checks)
                 continue
 
-            # Sizes match — now check the modification time.
-            # If the file was modified in the last 3 seconds, the FTP
-            # connection may still be open despite a momentary pause.
-            age = time.time() - file_path.stat().st_mtime
-            if age < 3.0:
-                logger.debug("STABILITY YOUNG %s  size=%d bytes  mtime_age=%.1fs (attempt %d/%d)",
-                             file_path.name, size_a, age, attempt, max_checks)
-                continue
-
-            logger.info("STABLE %s  size=%d bytes  mtime_age=%.1fs  (after %d check pair%s)",
-                        file_path.name, size_a, age, attempt,
+            # Sizes match — file is fully written
+            logger.info("STABLE %s  size=%d bytes  (after %d check pair%s)",
+                        file_path.name, size_a, attempt,
                         "s" if attempt > 1 else "")
             return True
 
