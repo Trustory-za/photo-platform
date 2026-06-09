@@ -122,8 +122,8 @@ handler.authorizer = authorizer
 handler.umask = 0o022
 
 server = FTPServer(("0.0.0.0", 2121), handler)
-server.max_cons = 20
-server.max_cons_per_ip = 3
+server.max_cons = 256
+server.max_cons_per_ip = 50
 
 
 def main():
