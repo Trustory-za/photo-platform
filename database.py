@@ -85,6 +85,8 @@ def _init_db() -> None:
     except sqlite3.OperationalError:
         pass  # Column already exists
     conn.execute(_PURCHASES_SCHEMA)
+    conn.execute(_BASKET_ORDERS_SCHEMA)
+    conn.execute(_BASKET_ORDER_ITEMS_SCHEMA)
     conn.commit()
     conn.close()
 
@@ -227,6 +229,171 @@ def mark_downloaded(token: str) -> bool:
     try:
         cursor = conn.execute(
             "UPDATE purchases SET status = 'downloaded' WHERE download_token = ? AND status = 'paid'",
+            (token,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ── Basket orders table schema (multi-photo checkout) ───────────────
+
+_BASKET_ORDERS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS basket_orders (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    buyer_name          TEXT    NOT NULL,
+    email               TEXT    NOT NULL,
+    paystack_reference  TEXT    NOT NULL UNIQUE,
+    amount_zar          INTEGER NOT NULL,
+    status              TEXT    NOT NULL DEFAULT 'pending',
+    download_token      TEXT    UNIQUE,
+    created_at          TEXT    NOT NULL,
+    paid_at             TEXT
+);
+"""
+
+_BASKET_ORDER_ITEMS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS basket_order_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id    INTEGER NOT NULL,
+    photo_id    INTEGER NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES basket_orders(id),
+    FOREIGN KEY (photo_id) REFERENCES photos(id)
+);
+"""
+
+
+# ── Basket order functions ──────────────────────────────────────────
+
+def create_basket_order(
+    buyer_name: str,
+    email: str,
+    reference: str,
+    amount_zar: int,
+    photo_ids: list[int],
+) -> int:
+    """Insert a pending basket order with its line items.
+
+    Args:
+        buyer_name: The buyer's full name.
+        email: The buyer's email address.
+        reference: The Paystack transaction reference (must be unique).
+        amount_zar: The total price in cents, calculated server-side.
+        photo_ids: The de-duplicated list of photo IDs in the basket.
+
+    Returns:
+        The row ID of the newly inserted basket order.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO basket_orders
+                (buyer_name, email, paystack_reference, amount_zar, status, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?)
+            """,
+            (buyer_name, email, reference, amount_zar, now),
+        )
+        order_id = cursor.lastrowid
+        if order_id is None:
+            raise RuntimeError("Basket order insert succeeded but returned no row ID.")
+        conn.executemany(
+            "INSERT INTO basket_order_items (order_id, photo_id) VALUES (?, ?)",
+            [(order_id, photo_id) for photo_id in photo_ids],
+        )
+        conn.commit()
+        return order_id
+    finally:
+        conn.close()
+
+
+def get_basket_order_by_reference(reference: str) -> Optional[dict[str, Any]]:
+    """Look up a basket order by its Paystack transaction reference."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM basket_orders WHERE paystack_reference = ?", (reference,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def confirm_basket_order(reference: str, download_token: str) -> Optional[int]:
+    """Mark a basket order as paid and attach its download token.
+
+    Args:
+        reference: The Paystack transaction reference.
+        download_token: A unique UUID string for download access.
+
+    Returns:
+        The basket order ID if found and updated, or None if not found.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE basket_orders
+            SET status = 'paid', paid_at = ?, download_token = ?
+            WHERE paystack_reference = ? AND status = 'pending'
+            """,
+            (now, download_token, reference),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return None
+        row = conn.execute(
+            "SELECT id FROM basket_orders WHERE paystack_reference = ?",
+            (reference,),
+        ).fetchone()
+        return row["id"] if row else None
+    finally:
+        conn.close()
+
+
+def get_basket_order_by_token(token: str) -> Optional[dict[str, Any]]:
+    """Look up a basket order by its download token."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM basket_orders WHERE download_token = ?", (token,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_basket_order_photos(order_id: int) -> list[dict[str, Any]]:
+    """Return every photo belonging to a basket order."""
+    conn = _get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT photos.* FROM photos
+            INNER JOIN basket_order_items ON basket_order_items.photo_id = photos.id
+            WHERE basket_order_items.order_id = ?
+            ORDER BY basket_order_items.id
+            """,
+            (order_id,),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_basket_order_downloaded(token: str) -> bool:
+    """Mark a basket order's status as 'downloaded' after first access.
+
+    Does not invalidate the token — each paid photo remains individually
+    downloadable, unlike the single-use legacy purchase token.
+    """
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            "UPDATE basket_orders SET status = 'downloaded' WHERE download_token = ? AND status = 'paid'",
             (token,),
         )
         conn.commit()

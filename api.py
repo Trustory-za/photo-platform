@@ -12,13 +12,15 @@ Usage:
 
 import os
 import uuid
+from html import escape
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from pydantic import BaseModel
 
 import database
 
@@ -41,7 +43,12 @@ PAYSTACK_CALLBACK_URL = os.environ.get(
 PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
 PAYSTACK_VERIFY_URL = "https://api.paystack.co/transaction/verify"
 
-PHOTO_PRICE_ZAR = 50000  # R500.00 in cents
+# The frontend origin that hosts the buyer-facing download handoff page.
+FRONTEND_BASE_URL = os.environ.get(
+    "FRONTEND_BASE_URL", "https://images.olympusbot.cloud"
+)
+
+PHOTO_PRICE_ZAR = 15000  # R150.00 in cents — pilot price, server-side truth
 
 app = FastAPI(
     title="Trustory Images API",
@@ -308,9 +315,112 @@ def purchase_photo(
     }
 
 
+class BasketPurchaseRequest(BaseModel):
+    name: str
+    email: str
+    photo_ids: list[int]
+
+
+@app.post("/basket/purchase")
+def purchase_basket(
+    body: BasketPurchaseRequest,
+    x_api_key: str | None = Header(None),
+):
+    """Initialize a single Paystack checkout covering every photo in a basket."""
+    _verify_api_key(x_api_key)
+
+    name = body.name.strip()
+    email = body.email.strip()
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="A valid email address is required")
+    if not body.photo_ids:
+        raise HTTPException(status_code=400, detail="At least one photo is required")
+
+    # De-duplicate while preserving basket order
+    seen: set[int] = set()
+    photo_ids: list[int] = []
+    for photo_id in body.photo_ids:
+        if photo_id not in seen:
+            seen.add(photo_id)
+            photo_ids.append(photo_id)
+
+    for photo_id in photo_ids:
+        if database.get_photo(photo_id) is None:
+            raise HTTPException(status_code=404, detail=f"Photo {photo_id} not found")
+
+    if not PAYSTACK_SECRET_KEY:
+        raise HTTPException(
+            status_code=502,
+            detail="Payment gateway is not configured",
+        )
+
+    # Amount is calculated server-side only — never trust a client-sent total.
+    amount_zar = len(photo_ids) * PHOTO_PRICE_ZAR
+    reference = str(uuid.uuid4())
+
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "email": email,
+        "amount": amount_zar,
+        "currency": "ZAR",
+        "reference": reference,
+        "callback_url": PAYSTACK_CALLBACK_URL,
+        "metadata": {
+            "kind": "basket",
+            "photo_ids": photo_ids,
+            "buyer_name": name,
+        },
+    }
+
+    try:
+        resp = requests.post(
+            PAYSTACK_INIT_URL,
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException:
+        raise HTTPException(
+            status_code=502,
+            detail="Payment gateway error",
+        )
+
+    if not data.get("status"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Paystack error: {data.get('message', 'unknown')}",
+        )
+
+    authorization_url = data["data"]["authorization_url"]
+
+    # Only persist the pending order once Paystack has confirmed initialize succeeded.
+    database.create_basket_order(name, email, reference, amount_zar, photo_ids)
+
+    return {
+        "payment_url": authorization_url,
+        "authorization_url": authorization_url,
+        "reference": reference,
+        "amount_zar": amount_zar,
+    }
+
+
 @app.get("/payment/verify")
 def verify_payment(reference: str = Query(...)):
     """Callback endpoint called by Paystack after payment."""
+    if not PAYSTACK_SECRET_KEY:
+        raise HTTPException(
+            status_code=502,
+            detail="Payment gateway is not configured",
+        )
+
     headers = {
         "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
         "Content-Type": "application/json",
@@ -336,22 +446,114 @@ def verify_payment(reference: str = Query(...)):
             "message": "Payment was not successful",
         }
 
-    # Payment was successful — generate download token
-    download_token = str(uuid.uuid4())
-    purchase_id = database.confirm_purchase(reference, download_token)
+    paid_amount = data["data"].get("amount")
 
-    if purchase_id is None:
-        return {
-            "status": "error",
-            "message": "Purchase not found or already processed",
-        }
+    # Multi-photo basket orders take priority — a reference can only ever
+    # belong to one order type since it's a freshly generated UUID.
+    basket_order = database.get_basket_order_by_reference(reference)
+    if basket_order is not None:
+        if paid_amount != basket_order["amount_zar"]:
+            return {
+                "status": "error",
+                "message": "Paid amount does not match the order total",
+            }
 
-    return RedirectResponse(url=f"/download/{download_token}")
+        download_token = str(uuid.uuid4())
+        order_id = database.confirm_basket_order(reference, download_token)
+
+        if order_id is None:
+            return {
+                "status": "error",
+                "message": "Order not found or already processed",
+            }
+
+        return RedirectResponse(url=f"{FRONTEND_BASE_URL}/download/{download_token}")
+
+    # Legacy single-photo purchase flow — unchanged behaviour.
+    purchase = database.get_purchase_by_reference(reference)
+    if purchase is not None:
+        if paid_amount != purchase["amount_zar"]:
+            return {
+                "status": "error",
+                "message": "Paid amount does not match the purchase total",
+            }
+
+        download_token = str(uuid.uuid4())
+        purchase_id = database.confirm_purchase(reference, download_token)
+
+        if purchase_id is None:
+            return {
+                "status": "error",
+                "message": "Purchase not found or already processed",
+            }
+
+        return RedirectResponse(url=f"/download/{download_token}")
+
+    return {
+        "status": "error",
+        "message": "Transaction not found",
+    }
+
+
+def _render_basket_download_page(token: str, photos: list[dict]) -> str:
+    """Render a minimal, self-contained HTML page listing paid basket
+    photos with per-photo download buttons. Never includes filesystem
+    paths — download links only reference the public token and photo ID."""
+    items_html = []
+    for photo in photos:
+        photo_id = photo["id"]
+        label = escape(photo.get("headline") or photo.get("filename") or f"Photo {photo_id}")
+        preview_url = escape(
+            f"https://photos.olympusbot.cloud/photos/{photo_id}/preview"
+        )
+        items_html.append(f"""
+        <div class="item">
+          <img src="{preview_url}" alt="{label}" loading="lazy" />
+          <div class="item-info">
+            <p class="item-title">{label}</p>
+            <a class="btn" href="/download/{token}/photos/{photo_id}">Download original</a>
+          </div>
+        </div>""")
+
+    count = len(photos)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Your downloads — The Sport Collective</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background:#1a1a1a; color:#fff; margin:0; padding:48px 20px; }}
+  h1 {{ font-size:24px; margin:0 0 8px; text-align:center; }}
+  p.sub {{ color:#999; margin:0 0 32px; text-align:center; }}
+  .grid {{ display:grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap:20px; max-width:960px; margin:0 auto; }}
+  .item {{ background:#242424; border-radius:12px; overflow:hidden; }}
+  .item img {{ width:100%; height:160px; object-fit:cover; display:block; background:#333; }}
+  .item-info {{ padding:14px; }}
+  .item-title {{ font-size:13px; margin:0 0 10px; color:#eee; }}
+  .btn {{ display:inline-block; background:#007749; color:#fff; text-decoration:none; padding:10px 16px; border-radius:8px; font-size:13px; font-weight:700; }}
+</style>
+</head>
+<body>
+  <h1>Your downloads are ready</h1>
+  <p class="sub">{count} photo{'s' if count != 1 else ''} paid in full — each button downloads the full-resolution, watermark-free original.</p>
+  <div class="grid">{''.join(items_html)}</div>
+</body>
+</html>"""
 
 
 @app.get("/download/{token}")
 def download_original(token: str):
-    """Download the original photo using a single-use token."""
+    """Serve a paid basket order's download listing page, or download a
+    single legacy purchase's original photo using a single-use token."""
+    basket_order = database.get_basket_order_by_token(token)
+    if basket_order is not None:
+        if basket_order["status"] not in ("paid", "downloaded"):
+            raise HTTPException(status_code=403, detail="Payment not confirmed for this order")
+
+        photos = database.list_basket_order_photos(basket_order["id"])
+        return HTMLResponse(_render_basket_download_page(token, photos))
+
     purchase = database.get_purchase_by_token(token)
     if purchase is None:
         raise HTTPException(status_code=404, detail="Download token not found")
@@ -374,5 +576,40 @@ def download_original(token: str):
 
     # Mark token as used (single-use)
     database.mark_downloaded(token)
+
+    return FileResponse(str(p), media_type="image/jpeg", filename=p.name)
+
+
+@app.get("/download/{token}/photos/{photo_id}")
+def download_basket_photo(token: str, photo_id: int):
+    """Download one original photo from a paid basket order.
+
+    Unlike the legacy single-photo token, this token is not single-use —
+    every paid photo in the order remains individually downloadable.
+    """
+    basket_order = database.get_basket_order_by_token(token)
+    if basket_order is None:
+        raise HTTPException(status_code=404, detail="Download token not found")
+
+    if basket_order["status"] not in ("paid", "downloaded"):
+        raise HTTPException(status_code=403, detail="Payment not confirmed for this order")
+
+    order_photo_ids = {p["id"] for p in database.list_basket_order_photos(basket_order["id"])}
+    if photo_id not in order_photo_ids:
+        raise HTTPException(status_code=404, detail="Photo not part of this order")
+
+    photo = database.get_photo(photo_id)
+    if photo is None:
+        raise HTTPException(status_code=404, detail="Photo not found")
+
+    original_path = photo.get("original_path")
+    if not original_path:
+        raise HTTPException(status_code=404, detail="Original file path not set")
+
+    p = Path(original_path)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Original file not found on disk")
+
+    database.mark_basket_order_downloaded(token)
 
     return FileResponse(str(p), media_type="image/jpeg", filename=p.name)
