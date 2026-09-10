@@ -10,10 +10,12 @@ Usage:
     uvicorn api:app --host 0.0.0.0 --port 8090
 """
 
+import hashlib
 import os
 import uuid
 from html import escape
 from pathlib import Path
+from urllib.parse import unquote
 
 import requests
 from dotenv import load_dotenv
@@ -108,31 +110,234 @@ def _sanitise(photo: dict) -> dict:
     return sanitised
 
 
-# ── Endpoints ───────────────────────────────────────────────────────
+# ── Event slug helpers ──────────────────────────────────────────────
 
+_SLUG_STRIP_CHARS = (":", "/", "\\", "'", '"')
+
+
+def slugify_event_headline(headline: str) -> str:
+    """Convert an event headline into its canonical URL slug.
+
+    Must exactly reproduce slugs generated before this helper existed
+    (commas and ampersands are intentionally preserved) since those
+    slugs are already published and linked externally. In particular the
+    legacy code collapsed repeated hyphens with a single non-recursive
+    `str.replace("--", "-")` pass — NOT a full regex collapse — so runs
+    of 3+ hyphens do not fully reduce to one (3 hyphens -> 2, 4 -> 2,
+    5 -> 3, ...). Reproduce that exact pass here rather than using
+    `re.sub("-{2,}", "-", ...)`, which would silently change already
+    published URLs for headlines with such runs.
+    """
+    slug = headline.lower().replace(" ", "-")
+    for ch in _SLUG_STRIP_CHARS:
+        slug = slug.replace(ch, "")
+    slug = slug.replace("--", "-")
+    return slug.strip("-")
+
+
+def _group_headlines_by_legacy_base(headlines) -> dict[str, list[str]]:
+    """Group distinct headlines by their legacy `slugify_event_headline`
+    base slug, iterating in deterministic sorted order."""
+    groups: dict[str, list[str]] = {}
+    for headline in sorted(set(headlines)):
+        groups.setdefault(slugify_event_headline(headline), []).append(headline)
+    return groups
+
+
+# Placeholder used in place of an empty legacy base slug. A headline that
+# reduces to "" (e.g. pure punctuation) can never have been a working
+# published URL — "/events/" cannot route to {slug} — so it's never
+# eligible to keep an exact legacy slug and always goes through
+# hash-suffix assignment below, using this fixed base instead of "".
+_EMPTY_LEGACY_BASE_PLACEHOLDER = "event"
+
+
+def build_event_slug_map(headlines) -> dict[str, str]:
+    """Map every distinct headline in `headlines` to a stable, unique
+    event slug.
+
+    `slugify_event_headline` is a lossy legacy transform (it strips
+    slashes, colons, quotes, and collapses spacing/hyphens), so distinct
+    headlines such as 'A/B' and 'AB' can reduce to the same base slug.
+    Collapsing them would let /events emit duplicate slugs and let
+    /events/{slug} merge unrelated photos.
+
+    Headlines are grouped by their legacy base slug. A headline whose
+    base is unique (and non-empty) keeps that exact legacy slug
+    unchanged, so already published/linked URLs keep resolving — these
+    bases are reserved first, before any collision slug is generated, so
+    a generated candidate can never collide with one of them regardless
+    of processing order.
+
+    A headline sharing its base with other distinct headlines, or whose
+    base is empty, instead gets `<base-or-placeholder>-<suffix>`, where
+    `<suffix>` is derived from a SHA-256 hash of its own full headline
+    text. Colliding bases (and the headlines within each) are processed
+    in sorted order and checked against every slug reserved so far —
+    spanning both untouched legacy bases and previously generated
+    collision slugs — extending the digest suffix (and, in the
+    exhausted-digest edge case, appending a counter) until unique. This
+    makes the whole map globally unique, deterministic, and independent
+    of the order headlines are supplied in.
+
+    Note: when a collision group grows (e.g. a second headline is added
+    that collides with a previously solo-published one), the previously
+    published bare base slug stops being anyone's canonical slug here.
+    Backward-compatible resolution of that old bare slug is handled
+    separately by `build_legacy_alias_map`.
+    """
+    groups = _group_headlines_by_legacy_base(headlines)
+
+    slug_map: dict[str, str] = {}
+    reserved: set[str] = set()
+    collision_bases: list[str] = []
+
+    # Reserve every non-colliding, non-empty legacy base first, so it can
+    # never be clobbered by a generated candidate from an unrelated
+    # collision group.
+    for base, group_headlines in groups.items():
+        if base and len(group_headlines) == 1:
+            slug_map[group_headlines[0]] = base
+            reserved.add(base)
+        else:
+            collision_bases.append(base)
+
+    for base in sorted(collision_bases):
+        effective_base = base or _EMPTY_LEGACY_BASE_PLACEHOLDER
+        for headline in sorted(groups[base]):
+            digest = hashlib.sha256(headline.encode("utf-8")).hexdigest()
+            suffix_len = 10
+            candidate = f"{effective_base}-{digest[:suffix_len]}"
+            counter = 0
+            while candidate in reserved:
+                if suffix_len < len(digest):
+                    suffix_len += 6
+                    candidate = f"{effective_base}-{digest[:suffix_len]}"
+                else:
+                    counter += 1
+                    candidate = f"{effective_base}-{digest}-{counter}"
+            slug_map[headline] = candidate
+            reserved.add(candidate)
+
+    return slug_map
+
+
+def build_legacy_alias_map(photos) -> dict[str, str]:
+    """Map each legacy base slug abandoned by a growing collision group
+    back to the single headline that deterministically "owns" it, for
+    backward-compatible alias resolution in GET /events/{slug}.
+
+    When a headline was once alone under its legacy base (and so was
+    published with that exact bare slug) and a later-added headline
+    collides with it, the whole group's canonical slugs become
+    hash-suffixed and the bare legacy base is no longer anyone's
+    canonical slug. Existing external links to that bare base must keep
+    resolving — to whichever headline actually held that bare slug
+    before the collision, never to a later-added collider.
+
+    Ownership is therefore derived from durable creation history, not
+    headline text: within a colliding group, the headline whose
+    earliest persisted photo `id` (an AUTOINCREMENT primary key, so a
+    reliable proxy for "was published first") is lowest keeps the alias.
+    This is independent of database/list order — unlike relying on
+    ordering, it also cannot be defeated by a later-added headline that
+    merely happens to sort first lexicographically. A photo with a
+    missing or non-integer `id` is treated defensively as having no
+    usable creation time and ranks after every group member that has
+    one; only if no member of a group has a usable id (or as a final,
+    practically-unreachable tie-break) does resolution fall back to
+    lexicographic headline order, matching the prior behavior for that
+    edge case.
+    """
+    headlines = [p.get("headline") or "Unknown Event" for p in photos]
+    groups = _group_headlines_by_legacy_base(headlines)
+
+    earliest_id: dict[str, int] = {}
+    for p in photos:
+        headline = p.get("headline") or "Unknown Event"
+        try:
+            photo_id = int(p.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if headline not in earliest_id or photo_id < earliest_id[headline]:
+            earliest_id[headline] = photo_id
+
+    def _owner_sort_key(headline: str):
+        photo_id = earliest_id.get(headline)
+        if photo_id is None:
+            return (1, 0, headline)
+        return (0, photo_id, headline)
+
+    return {
+        base: min(group, key=_owner_sort_key)
+        for base, group in groups.items()
+        if base and len(group) > 1
+    }
+
+
+def _normalize_route_segment(segment: str) -> str:
+    """Safely percent-decode an incoming URL path segment before it's
+    used for comparison. Tolerates malformed percent-encoding and
+    encoded Unicode without ever raising."""
+    try:
+        return unquote(segment, errors="replace")
+    except Exception:
+        return segment
+
+
+# ── Endpoints ───────────────────────────────────────────────────────
 
 
 @app.get("/events/{slug}")
 def get_event_photos(slug: str):
-    """Return all photos for a specific event by slug."""
+    """Return all photos for a specific event by slug.
+
+    ASGI servers hand route functions a path segment that's already
+    been percent-decoded once off the wire, so `slug` here may already
+    be the canonical slug verbatim (e.g. a literal '%2F' substring from
+    a headline, sent by the client as '%252F'). Try that value first.
+    Only fall back to decoding it again for older/lenient clients that
+    still send a slug that itself needs one more decode — malformed
+    sequences must never raise.
+
+    Two distinct headlines can have canonical slugs where one is the
+    once-decoded form of the other (e.g. 'sale-%25-off' decodes to
+    'sale-%-off'). Matching against both candidates in a single pass
+    would ambiguously collapse them into one response, so exact raw
+    matches are computed first and returned alone; the once-decoded
+    candidate is only used as a fallback when there are zero exact
+    matches.
+
+    A requested slug can also be a legacy bare base slug that a growing
+    collision group has since abandoned as anyone's canonical slug (see
+    `build_legacy_alias_map`). That alias is checked next, ahead of the
+    once-decoded fallback, and resolves to only the deterministic legacy
+    owner's photos — never merged with the other colliding headline(s).
+    """
     photos = database.list_all_photos()
-    result = []
+    headlines = [p.get("headline") or "Unknown Event" for p in photos]
+    slug_map = build_event_slug_map(headlines)
+    alias_map = build_legacy_alias_map(photos)
+    once_decoded = _normalize_route_segment(slug)
+    exact_matches = []
+    alias_matches = []
+    decoded_matches = []
     for p in photos:
         headline = p.get("headline") or "Unknown Event"
-        photo_slug = (
-            headline.lower()
-            .replace(" ", "-")
-            .replace(":", "")
-            .replace("/", "")
-            .replace("\\", "")
-            .replace("'", "")
-            .replace('"', "")
-            .replace("--", "-")
-            .strip("-")
-        )
-        if photo_slug == slug:
-            result.append(_sanitise(p))
-    return result
+        canonical = slug_map[headline]
+        if canonical == slug:
+            exact_matches.append(p)
+        elif slug in alias_map and headline == alias_map[slug]:
+            alias_matches.append(p)
+        elif once_decoded != slug and canonical == once_decoded:
+            decoded_matches.append(p)
+    if exact_matches:
+        matches = exact_matches
+    elif alias_matches:
+        matches = alias_matches
+    else:
+        matches = decoded_matches
+    return [_sanitise(p) for p in matches]
 
 @app.get("/health")
 def health():
@@ -166,6 +371,8 @@ def search_photos(
 def list_events():
     """Return all photos grouped by headline into events."""
     photos = database.list_all_photos()
+    headlines = [p.get("headline") or "Unknown Event" for p in photos]
+    slug_map = build_event_slug_map(headlines)
 
     # Group photos by headline
     events: dict[str, dict] = {}
@@ -184,18 +391,7 @@ def list_events():
                     location = parts[0].strip()
                     break
 
-            # Sanitise headline into a URL slug
-            slug = (
-                headline.lower()
-                .replace(" ", "-")
-                .replace(":", "")
-                .replace("/", "")
-                .replace("\\", "")
-                .replace("'", "")
-                .replace('"', "")
-                .replace("--", "-")
-                .strip("-")
-            )
+            slug = slug_map[headline]
 
             events[headline] = {
                 "headline": headline,

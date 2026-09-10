@@ -1,0 +1,4 @@
+# Test-only dependencies. Install with: pip install -r requirements-dev.txt
+# (also requires -r requirements.txt for the app's own runtime deps)
+pytest==9.1.1
+httpx==0.28.1

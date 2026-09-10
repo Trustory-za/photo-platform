@@ -14,6 +14,7 @@ Usage:
 """
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,11 @@ from typing import Any, Optional
 
 # ── Database path ───────────────────────────────────────────────────────
 
-DB_PATH = Path(__file__).resolve().parent / "photos.db"
+# PHOTO_PLATFORM_DB_PATH lets tests (and other callers) redirect the
+# database file before import-time initialisation runs, without touching
+# the production database. Default behaviour is unchanged when unset.
+_DEFAULT_DB_PATH = Path(__file__).resolve().parent / "photos.db"
+DB_PATH = Path(os.environ.get("PHOTO_PLATFORM_DB_PATH") or _DEFAULT_DB_PATH)
 
 
 # ── Connection helpers ──────────────────────────────────────────────────
