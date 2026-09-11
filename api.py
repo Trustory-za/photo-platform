@@ -442,7 +442,13 @@ def get_preview(
     if not p.exists():
         raise HTTPException(status_code=404, detail="Preview file not found on disk")
 
-    return FileResponse(str(p), media_type="image/jpeg")
+    return FileResponse(
+        str(p),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800"
+        },
+    )
 
 
 @app.post("/photos/{photo_id}/purchase")

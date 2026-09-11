@@ -24,7 +24,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from iptcinfo3 import IPTCInfo
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+
+# Buyer-facing previews only need enough resolution for a sharp gallery/detail
+# view. Keeping camera-resolution previews makes a single page download tens of
+# megabytes on mobile connections.
+PREVIEW_MAX_EDGE = 1920
+PREVIEW_JPEG_QUALITY = 82
 
 
 # ── IPTC logic (self-contained, mirrors iptc_reader.py) ──────────────────────
@@ -106,8 +113,17 @@ def _find_best_font(text, target_height, font_path=None):
 
 
 def _apply_watermark(input_path: str, output_path: str) -> None:
-    """Tile '© The Sport Collective' at -30° rotation, 50 % opacity."""
-    src = Image.open(input_path).convert("RGBA")
+    """Create a web-sized JPEG preview with a tiled ownership watermark."""
+    with Image.open(input_path) as opened:
+        # Respect the camera's EXIF orientation before calculating dimensions.
+        src = ImageOps.exif_transpose(opened).convert("RGBA")
+
+    # The untouched original remains available for paid delivery. Only the
+    # watermarked browser preview is downscaled.
+    src.thumbnail(
+        (PREVIEW_MAX_EDGE, PREVIEW_MAX_EDGE),
+        Image.Resampling.LANCZOS,
+    )
     iw, ih = src.size
 
     text = "© The Sport Collective"
@@ -148,7 +164,13 @@ def _apply_watermark(input_path: str, output_path: str) -> None:
             overlay.paste(rot, (c * step_x + shift, r * step_y), rot)
 
     result = Image.alpha_composite(src, overlay).convert("RGB")
-    result.save(output_path, "JPEG", quality=95)
+    result.save(
+        output_path,
+        "JPEG",
+        quality=PREVIEW_JPEG_QUALITY,
+        optimize=True,
+        progressive=True,
+    )
 
 
 # ── Filesystem sanitisation helpers ─────────────────────────────────────
