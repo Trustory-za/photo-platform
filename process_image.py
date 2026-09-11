@@ -15,6 +15,7 @@ Usage:
     process_image.py <input_image> <output_directory>
 """
 
+import hashlib
 import json
 import re
 import shutil
@@ -192,6 +193,25 @@ def _format_date(date_str: str) -> str:
 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
+_HASH_SUFFIX_RE = re.compile(r"^(?P<stem>.+)__[0-9a-fA-F]{12}(?P<suffix>\.[^.]+)$")
+
+
+def _source_filename(internal_name: str) -> str:
+    """Remove the internal content-hash suffix from a camera filename."""
+    match = _HASH_SUFFIX_RE.match(internal_name)
+    if not match:
+        return internal_name
+    return f"{match.group('stem')}{match.group('suffix')}"
+
+
+def _sha256(path: Path) -> str:
+    """Return the image's content fingerprint."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 def process_image(input_path: str, output_dir: str) -> dict:
     """Run the full pipeline and return a JSON-serialisable result dict."""
     now = datetime.now(timezone.utc).isoformat()
@@ -212,6 +232,9 @@ def process_image(input_path: str, output_dir: str) -> dict:
             "error": f"Invalid file type: {inp.suffix}. Only JPG files are supported.",
             "processed_at": now,
         }
+
+    content_hash = _sha256(inp)
+    source_filename = _source_filename(inp.name)
 
     # ── 1. Read IPTC metadata (needed early for folder structure) ────────
     iptc_data = _extract_iptc(str(inp))
@@ -244,8 +267,10 @@ def process_image(input_path: str, output_dir: str) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 4. Prepare filenames ──────────────────────────────────────────────
-    orig_name = f"original_{inp.name}"
-    preview_name = f"preview_{inp.name}"
+    source = Path(source_filename)
+    storage_name = f"{source.stem}__{content_hash[:12]}{source.suffix}"
+    orig_name = f"original_{storage_name}"
+    preview_name = f"preview_{storage_name}"
 
     orig_path = out_dir / orig_name
     preview_path = out_dir / preview_name
@@ -261,7 +286,8 @@ def process_image(input_path: str, output_dir: str) -> dict:
             "success": False,
             "error": f"Watermark failed: {e}",
             "original_path": str(orig_path.resolve()),
-            "original_filename": inp.name,
+            "original_filename": source_filename,
+            "content_sha256": content_hash,
             "original_photographer": photographer_safe,
             "original_subdir": subdir_name,
             "iptc": iptc_data,
@@ -274,7 +300,8 @@ def process_image(input_path: str, output_dir: str) -> dict:
 
     return {
         "success": True,
-        "original_filename": inp.name,
+        "original_filename": source_filename,
+        "content_sha256": content_hash,
         "original_photographer": photographer_safe,
         "original_subdir": subdir_name,
         "photographer": photographer,

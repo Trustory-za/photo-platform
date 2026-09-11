@@ -13,6 +13,7 @@ Usage:
     all_photos = database.list_all_photos()
 """
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -40,18 +41,13 @@ def _get_connection() -> sqlite3.Connection:
     return conn
 
 
-def _ensure_unique_index() -> None:
-    """
-    Ensure a unique index on filename so duplicate rows are impossible.
-    Created separately from _init_db so existing databases pick it up
-    without a full migration.
-    """
-    conn = _get_connection()
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_filename ON photos(filename)"
-    )
-    conn.commit()
-    conn.close()
+def _file_sha256(path: Path) -> str:
+    """Return a file's SHA-256 fingerprint without loading it into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _init_db() -> None:
@@ -60,6 +56,7 @@ def _init_db() -> None:
     CREATE TABLE IF NOT EXISTS photos (
         id                  INTEGER PRIMARY KEY AUTOINCREMENT,
         filename            TEXT    NOT NULL,
+        content_sha256      TEXT,
         original_path       TEXT    NOT NULL,
         preview_path        TEXT    NOT NULL,
         file_size_original   INTEGER,
@@ -80,15 +77,46 @@ def _init_db() -> None:
     """
     conn = _get_connection()
     conn.execute(sql)
-    # Ensure unique index on filename (for existing databases)
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_filename ON photos(filename)"
-    )
     # Migration: add event column for existing databases
     try:
         conn.execute("ALTER TABLE photos ADD COLUMN event TEXT")
     except sqlite3.OperationalError:
         pass  # Column already exists
+    try:
+        conn.execute("ALTER TABLE photos ADD COLUMN content_sha256 TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Camera filenames repeat. They are searchable metadata, not identity.
+    conn.execute("DROP INDEX IF EXISTS idx_photos_filename")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_filename ON photos(filename)")
+
+    # Fingerprint retained legacy originals without deleting existing rows.
+    seen_hashes = {
+        row[0]
+        for row in conn.execute(
+            "SELECT content_sha256 FROM photos WHERE content_sha256 IS NOT NULL"
+        ).fetchall()
+    }
+    legacy_rows = conn.execute(
+        "SELECT id, original_path FROM photos WHERE content_sha256 IS NULL ORDER BY id"
+    ).fetchall()
+    for row_id, original_path in legacy_rows:
+        path = Path(original_path)
+        if not path.is_file():
+            continue
+        content_hash = _file_sha256(path)
+        if content_hash in seen_hashes:
+            continue
+        conn.execute(
+            "UPDATE photos SET content_sha256 = ? WHERE id = ?",
+            (content_hash, row_id),
+        )
+        seen_hashes.add(content_hash)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_content_sha256 "
+        "ON photos(content_sha256) WHERE content_sha256 IS NOT NULL"
+    )
     conn.execute(_PURCHASES_SCHEMA)
     conn.execute(_BASKET_ORDERS_SCHEMA)
     conn.execute(_BASKET_ORDER_ITEMS_SCHEMA)
@@ -454,22 +482,24 @@ def insert_photo(result: dict[str, Any]) -> int:
     # Full IPTC dump as JSON
     full_iptc = json.dumps(iptc, ensure_ascii=False, default=str)
 
-    # Derive filename from the original_path (strips "original_" prefix)
-    filename = _derive_filename(result)
+    # Keep the camera filename for display; content hash is the real identity.
+    filename = result.get("original_filename") or _derive_filename(result)
+    content_sha256 = result.get("content_sha256")
 
     conn = _get_connection()
     try:
         cursor = conn.execute(
             """
-            INSERT OR REPLACE INTO photos (
-                filename, original_path, preview_path,
+            INSERT INTO photos (
+                filename, content_sha256, original_path, preview_path,
                 file_size_original, file_size_preview, processed_at,
                 caption, keywords, byline, copyright, city, country,
                 headline, source, event, full_iptc, search_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 filename,
+                content_sha256,
                 result.get("original_path", ""),
                 result.get("preview_path", ""),
                 result.get("file_size_original"),
@@ -496,6 +526,18 @@ def insert_photo(result: dict[str, Any]) -> int:
         conn.close()
 
     return row_id
+
+
+def get_photo_by_content_hash(content_sha256: str) -> Optional[dict[str, Any]]:
+    """Return the existing catalogue row for identical image bytes."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM photos WHERE content_sha256 = ?", (content_sha256,)
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+    finally:
+        conn.close()
 
 
 def _derive_filename(result: dict[str, Any]) -> str:

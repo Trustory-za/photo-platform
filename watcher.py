@@ -11,6 +11,7 @@ Usage:
 The watcher runs forever. Stop it with Ctrl+C.
 """
 
+import hashlib
 import json
 import logging
 import subprocess
@@ -60,9 +61,29 @@ logger.addHandler(ch)
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
+def _sha256(file_path: Path) -> str:
+    """Return a file's SHA-256 fingerprint."""
+    digest = hashlib.sha256()
+    with file_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 def _process_jpg(file_path: Path) -> None:
     """Run process_image.py on a JPG file and log the result."""
     logger.info("PROCESSING %s", file_path.name)
+
+    content_hash = _sha256(file_path)
+    existing = database.get_photo_by_content_hash(content_hash)
+    if existing is not None:
+        logger.info(
+            "DUPLICATE SKIPPED %s  matches photo_id=%s sha256=%s",
+            file_path.name,
+            existing["id"],
+            content_hash,
+        )
+        file_path.unlink(missing_ok=True)
+        return
 
     try:
         result = subprocess.run(
@@ -211,7 +232,9 @@ class JpgUploadHandler(PatternMatchingEventHandler):
 
     def _handle(self, event):
         """Process the file — wait for it to be fully written first."""
-        src = event.src_path
+        # FTP uploads are atomically moved from a hidden .part staging file
+        # to their final JPG path, so moved events must use dest_path.
+        src = getattr(event, "dest_path", None) or event.src_path
         logger.debug("_handle called: src_path=%s", src)
 
         file_path = Path(src)

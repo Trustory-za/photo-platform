@@ -13,11 +13,12 @@ Environment variables (loaded from .env):
     FTP_PASSWORD   Password for the 'photographer' user
 """
 
-import ftplib
+import hashlib
 import logging
 import os
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from pyftpdlib.authorizers import DummyAuthorizer
@@ -89,12 +90,34 @@ def configure_runtime(upload_dir: Path = UPLOAD_DIR, log_dir: Path = LOG_DIR) ->
         logger.addHandler(ch)
 
 
+# ── Upload identity helpers ─────────────────────────────────────────────
+
+def _sha256(path: Path) -> str:
+    """Return the SHA-256 fingerprint for a completed upload."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _staging_upload_path(requested_path: Path) -> Path:
+    """Create a unique, non-JPG staging path beside the requested file."""
+    return requested_path.parent / f".upload-{uuid4().hex}.part"
+
+
+def _final_upload_path(staged_path: Path, source_name: str, content_hash: str) -> Path:
+    """Build a collision-safe internal filename while retaining source identity."""
+    source = Path(source_name)
+    return staged_path.parent / f"{source.stem}__{content_hash[:12]}{source.suffix}"
+
+
 # ── Custom handler ──────────────────────────────────────────────────────
 
 class PhotoFTPHandler(FTPHandler):
     """Restrict photographers to upload-only in their sandbox.
 
-    - No overwrite of existing files
+    - Every upload is staged uniquely, so reused camera filenames are safe
     - No delete, rename, or retrieve
     - All uploads go to the sandboxed uploads/incoming/ directory
     """
@@ -109,22 +132,39 @@ class PhotoFTPHandler(FTPHandler):
         logger.warning("DOWNLOAD BLOCKED %s  (downloads not allowed)", file)
 
     def on_file_received(self, file):
-        """Log a successfully received upload.
-
-        Reads the size from disk rather than self.fsize (which does not
-        exist on FTPHandler and raised AttributeError on every upload).
-        Tolerates the watcher having already moved or deleted the file
-        before this callback runs.
-        """
+        """Fingerprint and atomically publish a completed staged upload."""
+        staged = Path(file)
+        source_name = getattr(self, "_upload_sources", {}).pop(str(staged), staged.name)
         try:
-            size = Path(file).stat().st_size
-        except OSError:
-            logger.info("UPLOAD %s  (size: unavailable)", file)
+            size = staged.stat().st_size
+            content_hash = _sha256(staged)
+            final_path = _final_upload_path(staged, source_name, content_hash)
+            if final_path.exists():
+                staged.unlink()
+                logger.info("DUPLICATE UPLOAD %s  sha256=%s", source_name, content_hash)
+                return
+            staged.replace(final_path)
+        except FileNotFoundError:
+            logger.info("UPLOAD %s  (size: unavailable; file no longer present)", source_name)
             return
-        logger.info("UPLOAD %s  (size: %d bytes)", file, size)
+        except OSError as exc:
+            logger.error("UPLOAD FINALISE FAILED %s  (%s)", source_name, exc)
+            return
+        logger.info(
+            "UPLOAD %s -> %s  (size: %d bytes, sha256=%s)",
+            source_name,
+            final_path.name,
+            size,
+            content_hash,
+        )
 
     def on_incomplete_file_received(self, file):
         logger.warning("INCOMPLETE UPLOAD %s", file)
+        getattr(self, "_upload_sources", {}).pop(str(file), None)
+        try:
+            Path(file).unlink(missing_ok=True)
+        except OSError:
+            logger.exception("FAILED TO REMOVE INCOMPLETE UPLOAD %s", file)
 
     def on_login(self, username):
         logger.info("LOGIN %s", username)
@@ -133,11 +173,13 @@ class PhotoFTPHandler(FTPHandler):
         logger.warning("LOGIN FAILED username=%s", username)
 
     def ftp_STOR(self, filepath):
-        """Prevent overwriting existing files."""
-        if os.path.exists(filepath):
-            logger.warning("OVERWRITE BLOCKED %s  (file already exists)", filepath)
-            raise ftplib.error_perm("550 File already exists; overwrite not allowed")
-        return super().ftp_STOR(filepath)
+        """Receive into a unique staging file instead of the camera filename."""
+        requested = Path(filepath)
+        staged = _staging_upload_path(requested)
+        if not hasattr(self, "_upload_sources"):
+            self._upload_sources = {}
+        self._upload_sources[str(staged)] = requested.name
+        return super().ftp_STOR(str(staged))
 
 
 # ── Server ──────────────────────────────────────────────────────────────
@@ -165,8 +207,7 @@ def main():
 
     authorizer = DummyAuthorizer()
 
-    # User 'photographer' — upload only, no delete/overwrite/rename/retrieve
-    # Overwrite blocking is handled in the custom ftp_STOR method above
+    # User 'photographer' — upload only, no delete/rename/retrieve.
     authorizer.add_user(
         "photographer",
         ftp_password,
